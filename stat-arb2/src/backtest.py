@@ -66,6 +66,7 @@ class BacktestResult:
     cumulative_pnl: pd.Series        # running sum
     positions: pd.DataFrame          # (T_oos × N) position matrix (+1/0/−1)
     s_scores: pd.DataFrame           # (T_oos × N) daily s-scores
+    ticker_pnl: pd.DataFrame = field(default_factory=pd.DataFrame)  # (T_oos × N) daily P&L per ticker
     daily_holdings: list[list[str]] = field(default_factory=list)  # list of tickers held each day
     daily_exposure: np.ndarray = field(default_factory=lambda: np.array([]))  # total gross exposure (abs units)
     trade_log: list[dict] = field(default_factory=list)
@@ -113,6 +114,7 @@ def run_backtest(
     positions = np.zeros((T_oos, N), dtype=np.float64)   # +1 / 0 / −1
     s_scores_arr = np.full((T_oos, N), np.nan)
     daily_pnl = np.zeros(T_oos)
+    pnl_by_ticker = np.zeros((T_oos, N), dtype=np.float64)  # per-ticker daily P&L
     daily_exposure = np.zeros(T_oos)
     daily_holdings: list[list[str]] = []
     trade_log: list[dict] = []
@@ -168,9 +170,30 @@ def run_backtest(
                 pass_set = set(
                     diag_tests.loc[diag_tests["tests_passed"] == 3, "ticker"]
                 )
+                prev_tradeable_mask = tradeable_mask.copy()   # snapshot before update
                 tradeable_mask = np.array(
                     [t in pass_set for t in tickers], dtype=bool
                 )
+
+                # ── Re-entry clock reset ───────────────────────────────
+                # If a held stock was previously *failing* the diagnostic tests
+                # but has just *re-passed* all three at this recalibration, its
+                # time-stop clock is reset to 0.  This rewards confirmation that
+                # the spread is still mean-reverting and gives the position a
+                # fresh MAX_HOLD_DAYS window to complete the mean-reversion.
+                #
+                # A stock that continually oscillates in/out every recalibration
+                # still ages normally between resets, so the time-stop remains
+                # meaningful.
+                re_entered   = (~prev_tradeable_mask) & tradeable_mask  # failed → passed
+                clock_reset  = re_entered & (pos != 0)                  # only held stocks
+                if clock_reset.any():
+                    days_held[clock_reset] = 0
+                    log.debug(
+                        "[recalib] Clock reset for %d re-entering tickers: %s",
+                        clock_reset.sum(),
+                        [tickers[i] for i in np.where(clock_reset)[0]],
+                    )
 
                 days_since_calib = 0
                 n_recalibs += 1
@@ -232,6 +255,7 @@ def run_backtest(
                 delta_spread = spread_now - spread_prev
                 pnl_contrib = pos * delta_spread
                 daily_pnl[t_oos] = np.nansum(pnl_contrib)
+                pnl_by_ticker[t_oos] += np.nan_to_num(pnl_contrib)  # daily carry per ticker
                 accum_pnl += pnl_contrib                      # Update per-ticker lifecycle P&L
 
             # ── 1-Day Execution Delay ─────────────────────────────
@@ -279,6 +303,7 @@ def run_backtest(
                 size_to_close = pos[i]
                 cost = abs(size_to_close) * cost_frac
                 daily_pnl[t_oos] -= cost
+                pnl_by_ticker[t_oos, i] -= cost          # exit cost attributed to ticker
                 si = s[i]
                 if stop_out[i]:
                     action = "STOP"
@@ -320,6 +345,7 @@ def run_backtest(
                     new_pos[i] = 0.0
                     cost = abs(size_to_close) * cost_frac
                     daily_pnl[t_oos] -= cost   # exit cost
+                    pnl_by_ticker[t_oos, i] -= cost          # exit cost attributed to ticker
                     trade_log.append({
                         "date": today, "ticker": tickers[i],
                         "action": "TIME_STOP", "s_score": si,
@@ -343,6 +369,7 @@ def run_backtest(
                         new_pos[i] = size
                         cost = size * cost_frac
                         daily_pnl[t_oos] -= cost   # entry cost
+                        pnl_by_ticker[t_oos, i] -= cost      # entry cost attributed to ticker
                         accum_pnl[i] -= cost       # Initial cost
                         trade_log.append({
                             "date": today, "ticker": tickers[i],
@@ -354,6 +381,7 @@ def run_backtest(
                         new_pos[i] = -size
                         cost = size * cost_frac
                         daily_pnl[t_oos] -= cost   # entry cost
+                        pnl_by_ticker[t_oos, i] -= cost      # entry cost attributed to ticker
                         accum_pnl[i] -= cost       # Initial cost
                         trade_log.append({
                             "date": today, "ticker": tickers[i],
@@ -387,8 +415,9 @@ def run_backtest(
     monthly_pnl_series = daily_pnl_series.resample("ME").sum().rename("monthly_pnl")
     cum_pnl            = daily_pnl_series.cumsum().rename("cumulative_pnl")
 
-    positions_df = pd.DataFrame(positions, index=oos_dates, columns=tickers)
-    s_scores_df  = pd.DataFrame(s_scores_arr, index=oos_dates, columns=tickers)
+    positions_df  = pd.DataFrame(positions, index=oos_dates, columns=tickers)
+    s_scores_df   = pd.DataFrame(s_scores_arr, index=oos_dates, columns=tickers)
+    ticker_pnl_df = pd.DataFrame(pnl_by_ticker, index=oos_dates, columns=tickers)
 
     execution_time = time.time() - start_time
 
@@ -399,6 +428,7 @@ def run_backtest(
         cumulative_pnl=cum_pnl,
         positions=positions_df,
         s_scores=s_scores_df,
+        ticker_pnl=ticker_pnl_df,
         daily_holdings=daily_holdings,
         daily_exposure=daily_exposure,
         trade_log=trade_log,
@@ -414,6 +444,7 @@ def print_backtest_summary(
     result: BacktestResult,
     cfg: StrategyConfig | None = None,
     benchmark_prices: pd.DataFrame | None = None,
+    label: str = "BACKTEST",
 ) -> None:
     """
     Print a concise human-readable summary of backtest results.
@@ -427,6 +458,9 @@ def print_backtest_summary(
         equal-weight buy-and-hold benchmark over the OOS period.  When provided,
         the benchmark Sharpe and cumulative return are printed alongside the
         strategy figures.
+    label : str
+        Title string shown in the summary header, e.g. "IN-SAMPLE" or
+        "OUT-OF-SAMPLE".  Defaults to ``"BACKTEST"``.
     """
     if cfg is None:
         cfg = StrategyConfig()
@@ -464,7 +498,7 @@ def print_backtest_summary(
     pos_months = (result.monthly_pnl > 0).mean()
 
     print("\n" + "=" * 60)
-    print("  BACKTEST SUMMARY")
+    print(f"  {label} SUMMARY")
     print("=" * 60)
     print(f"  Period          : {pnl.index[0].date()} → {pnl.index[-1].date()} ({n_days} days)")
     print(f"  Recalibrations  : {result.n_recalibs}")
@@ -533,17 +567,98 @@ def print_backtest_summary(
     print("=" * 60 + "\n")
 
 
+def print_ticker_pnl_summary(
+    result: BacktestResult,
+    top_n: int = 10,
+    label: str = "BACKTEST",
+) -> None:
+    """
+    Print a ranked table of per-ticker cumulative P&L contributions.
+
+    Parameters
+    ----------
+    result : BacktestResult
+    top_n : int
+        Number of best and worst contributors to display.  Default 10.
+    label : str
+        Title string shown in the header.
+    """
+    if result.ticker_pnl.empty:
+        print("  [ticker P&L not available]")
+        return
+
+    cum_ticker = result.ticker_pnl.sum()          # total P&L per ticker over the period
+    active     = cum_ticker[cum_ticker != 0]       # only tickers that traded
+
+    if active.empty:
+        print("  [no ticker activity]")
+        return
+
+    # Trade count per ticker from the trade log
+    trades = pd.DataFrame(result.trade_log)
+    if len(trades) > 0:
+        entries = trades[trades["action"].isin(["LONG", "SHORT"])]
+        trade_counts = entries.groupby("ticker").size()
+    else:
+        trade_counts = pd.Series(dtype=int)
+
+    best  = active.sort_values(ascending=False).head(top_n)
+    worst = active.sort_values(ascending=True ).head(top_n)
+
+    # Normalize bar lengths to the largest absolute value shown
+    max_abs_pnl = max(best.abs().max(), worst.abs().max())
+    max_abs_pnl = max(max_abs_pnl, 1e-9)  # avoid div-by-zero
+
+    def _row(ticker: str, pnl: float) -> str:
+        n_trades = trade_counts.get(ticker, 0)
+        n_blocks = int(abs(pnl) / max_abs_pnl * 20)
+        bar = "█" * n_blocks
+        sign_bar = f"+{bar}" if pnl >= 0 else f"-{bar}"
+        return (
+            f"  {ticker:<6s}  {pnl * 100:>+8.3f}%  "
+            f"{n_trades:>5d} trades  {sign_bar}"
+        )
+
+    print("\n" + "=" * 60)
+    print(f"  {label}  —  TICKER P&L SUMMARY")
+    print("=" * 60)
+    print(f"  Active tickers : {len(active)}")
+    print(f"  Total strategy : {active.sum() * 100:+.3f}%")
+    print("-" * 60)
+    print(f"  TOP {top_n} CONTRIBUTORS")
+    print(f"  {'Ticker':<6s}  {'Cum P&L':>8s}   {'Trades':>5s}")
+    print(f"  {'─'*6}  {'─'*8}   {'─'*5}  {'─'*20}")
+    for ticker, pnl in best.items():
+        print(_row(ticker, pnl))
+    print("-" * 60)
+    print(f"  BOTTOM {top_n} CONTRIBUTORS")
+    print(f"  {'Ticker':<6s}  {'Cum P&L':>8s}   {'Trades':>5s}")
+    print(f"  {'─'*6}  {'─'*8}   {'─'*5}  {'─'*20}")
+    for ticker, pnl in worst.items():
+        print(_row(ticker, pnl))
+    print("=" * 60 + "\n")
+
+
 def plot_equity_curve(
     result: BacktestResult,
+    oos_result: "BacktestResult | None" = None,
     benchmark_prices: pd.DataFrame | None = None,
     save_path: str = "equity_curve.png",
 ) -> None:
     """
     Plot cumulative P&L and drawdown.  Saves to ``save_path``.
 
+    When ``oos_result`` is provided, the IS and OOS periods are shown in
+    distinct colours with a vertical dashed separator so the reader can
+    immediately see whether out-of-sample performance resembles in-sample.
+
     Parameters
     ----------
     result : BacktestResult
+        In-sample (or single-run) backtest result.
+    oos_result : BacktestResult, optional
+        Out-of-sample backtest result.  When supplied, the OOS equity curve
+        is appended to the IS curve, offset so the two segments join smoothly.
     benchmark_prices : pd.DataFrame, optional
         Full price matrix aligned to the full date range.  When provided, an
         equal-weight buy-and-hold curve is overlaid on the equity chart.
@@ -555,7 +670,6 @@ def plot_equity_curve(
 
     pnl = result.daily_pnl
     cum = result.cumulative_pnl
-    drawdown = cum - cum.cummax()
 
     fig, (ax1, ax2) = plt.subplots(
         2, 1, figsize=(13, 7), sharex=True,
@@ -564,23 +678,54 @@ def plot_equity_curve(
     fig.suptitle("Statistical Arbitrage — Equity Curve", fontsize=14, fontweight="bold")
 
     # ── Equity curve ──────────────────────────────────────────
-    ax1.plot(cum.index, cum.values, color="#2196F3", linewidth=1.5, label="Strategy")
+    if oos_result is not None:
+        # IS segment in blue, OOS segment in green; OOS is offset so both join.
+        oos_cum = oos_result.cumulative_pnl + cum.iloc[-1]
+        oos_dd  = oos_result.cumulative_pnl - oos_result.cumulative_pnl.cummax()
 
+        ax1.plot(cum.index, cum.values,
+                 color="#2196F3", linewidth=1.5, label="Strategy (IS)")
+        ax1.plot(oos_cum.index, oos_cum.values,
+                 color="#4CAF50", linewidth=1.5, label="Strategy (OOS)")
+
+        # Vertical separator at IS/OOS boundary
+        boundary = oos_result.daily_pnl.index[0]
+        for ax in (ax1, ax2):
+            ax.axvline(boundary, color="gray", linewidth=1.0,
+                       linestyle="--", zorder=3)
+        ax1.text(boundary, ax1.get_ylim()[1],
+                 "  ← IS | OOS →", fontsize=8, color="gray",
+                 va="top", ha="left")
+
+        # Combined drawdown: IS drawdown and OOS drawdown in their own colours
+        is_dd = cum - cum.cummax()
+        ax2.fill_between(is_dd.index,  is_dd.values,  0,
+                         color="#F44336", alpha=0.45, label="Drawdown (IS)")
+        ax2.fill_between(oos_dd.index, oos_dd.values, 0,
+                         color="#FF9800", alpha=0.45, label="Drawdown (OOS)")
+    else:
+        ax1.plot(cum.index, cum.values,
+                 color="#2196F3", linewidth=1.5, label="Strategy")
+        drawdown = cum - cum.cummax()
+        ax2.fill_between(drawdown.index, drawdown.values, 0,
+                         color="#F44336", alpha=0.5, label="Drawdown")
+
+    # ── Benchmark ─────────────────────────────────────────────
     if benchmark_prices is not None:
-        bm = benchmark_prices.loc[pnl.index]
+        all_pnl_index = pnl.index
+        if oos_result is not None:
+            all_pnl_index = all_pnl_index.append(oos_result.daily_pnl.index)
+        bm = benchmark_prices.loc[benchmark_prices.index.isin(all_pnl_index)]
         bm_ret = np.log(bm / bm.shift(1)).dropna()
         bm_cum = bm_ret.mean(axis=1).cumsum()
         ax1.plot(bm_cum.index, bm_cum.values, color="#FF9800", linewidth=1.2,
-                 linestyle="--", label="Equal-Weight S&P 500")
+                 linestyle=":", label="Equal-Weight S&P 500")
 
     ax1.axhline(0, color="gray", linewidth=0.7, linestyle=":")
     ax1.set_ylabel("Cumulative P&L (log-return units)")
     ax1.legend(loc="upper left", fontsize=9)
     ax1.grid(True, alpha=0.3)
 
-    # ── Drawdown ──────────────────────────────────────────────
-    ax2.fill_between(drawdown.index, drawdown.values, 0,
-                     color="#F44336", alpha=0.5, label="Drawdown")
     ax2.axhline(0, color="gray", linewidth=0.7, linestyle=":")
     ax2.set_ylabel("Drawdown")
     ax2.set_xlabel("Date")
