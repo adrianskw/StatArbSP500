@@ -1,9 +1,6 @@
-# Quant-Finance-Projects
-
-
+# Project Objective
 
 This project implements two statistical arbitrage project, using agentic AI (Gemini + Antigravity) code development to learn and implement the concepts quicker.
-
 
 
 stat-arb1 is a primarily AI-driven implementation of stat arb.
@@ -26,7 +23,9 @@ stat-arb2 uses the intuition and knowledge gained from making stat-arb1.
 * Stitching of modules were AI-driven, then human-validated.
 
 # Multivariate Statistical Arbitrage Pipeline: S&P 500
-An event-driven backtesting engine for quantitative statistical arbitrage strategies, developed to extract outperformance across the S&P 500 equity universe.
+An event-driven backtesting engine for quantitative statistical arbitrage strategies, developed to extract outperformance across the S&P 500 equity universe. Interestingly, the outsized PNL in the OOS window can be attributed to the fluctuations from the merger of Paramount Global and Skydance Media to form Paramount Skydance (PSKY).
+
+![Alt text](stat-arb2/equity_curve_oos.png)
 
 ## Pipeline Architecture
 The pipeline is modeled directly on the canonical factor-based residual extraction frameworks (e.g., Avellaneda & Lee, 2010), combining dimensionality reduction and stochastic process modeling.
@@ -80,3 +79,4 @@ At the conclusion of the backtest loop, the system natively dumps out exhaustive
 *   **Equal-Weight Benchmark Comparisons**: Directly comparable Alpha and geometric baseline against an equal weight (1/N) benchmark spanning the S&P500 subset.
 *   **Equity Curve Modeling**: Two-panel automated chart execution visualizing benchmark-overlaid gross returns and max drawdown depth plotting.
 *   **Exit Breakdown Sub-Layer**: Matrix classification quantifying the explicit `Count`, `Total P&L`, and `% of P&L` specifically attributed to clean Mean-Reversion (Long/Short), Stop-Loss events, and general Time-Stops.
+* **Success attributions: The majority of the outsized success in the test set, interestingly, can be attributed to surge in price of Paramount Skydance (PSKY) after the merger of Paramount Global and Skydance Media.**
